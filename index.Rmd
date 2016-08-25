@@ -1,0 +1,423 @@
+---
+title: "Desafio VivaReal"
+author: "Emerson L. Machado"
+output:
+  html_document:
+    toc: true
+---
+
+<style type="text/css">
+  p {
+    font-size: 16px;
+  }
+  h1.title {
+    font-size: 38px;
+  }
+  h2 {
+    font-size: 30px;
+  }
+  h3 {
+    font-size: 20px;
+  }
+  h4 {
+    font-size: 18px;
+  }
+  .h1, .h2, .h3, h1, h2, h3 {
+    margin-top: 36px;
+  }
+  .h4, .h5, .h6, h4, h5, h6 {
+    margin-top: 36px;
+  }
+  h4.author {
+    margin-top: 10px;
+  }
+</style>
+
+
+```{r, label=initialize, include=FALSE, cache=TRUE}
+# Inicializa tudo
+# library(ggplot2)
+# library(gridExtra)
+# library(GGally)
+library(lattice)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(caret)
+library(randomForest)
+library(monomvn)
+library(Amelia)
+library(L1pack)
+library(combinat)
+library(knitr)
+library(corrplot)
+require(car)
+
+```{r, label=load_data, include=FALSE, cache=TRUE}
+setwd("/Users/ema/Documents/empregos/vivareal")
+train_all <- read.csv("train.csv")
+target_id <- function () {
+  which(colnames(train_set_numeric) == "target")
+}
+```
+
+
+# Código Fonte
+[Clique aqui](https://github.com/emada/vivareal) para o ver código fonte.
+
+
+
+# Reserva para Validação
+
+Reservei 20% dos dados para validar o modelo ao final da fase de aprendizado. Esse subconjunto servirá para confirmar se o modelo aprendido consegue realmente generalizar para dados não vistos. A motivação é que, mesmo utilizando validação cruzada com repetição, ainda há a chance de o modelo se ajustar aos dados de teste. Isso afeta o poder de generalização do modelo final, produzindo baixo erro na validação cruzada (durante o treinamento) mas alto erro na validação. Só depois que o modelo é aprendido é que utilizo o conjunto de validação para ter uma ideia de como ele se comportará em produção. Caso o modelo não fique bom, recomeço tudo novamente e busco uma nova alternativa.
+
+
+```{r, label=valid_set_creation, cache=TRUE}
+set.seed(1)
+sample_size <- round(0.2 * nrow(train_all))
+valid_ind <- sample(1:nrow(train_all), sample_size)
+valid_set <- train_all[valid_ind, ]
+train_set <- train_all[-valid_ind, ]
+
+# Get numeric factor variables
+numeric_variables <- which(mapply(is.numeric, train_set) == TRUE)
+factor_variables  <- which(mapply(is.factor, train_set)  == TRUE)
+train_set_numeric <- train_set[, numeric_variables]
+train_set_factor  <- train_set[, factor_variables]
+```
+
+
+
+
+# Análise Exploratória
+A base contém 22 variáveis, sendo um identificador `id`, um alvo `target` e as demais anônimas, sem indício do que sejam. Irei desconsiderar a variável `id`, pois ela não fornece nada de valor para a construção do modelo.
+
+```{r }
+train_set[, c("id")] <- NULL
+valid_set[, c("id")] <- NULL
+names(train_set)
+str(train_set)
+```
+
+Como visto acima, existem 10 variáveis categóricas e 12 variáveis numéricas. Para uma exploração inicial, irei focar primeiramente somente nas variáveis numéricas.
+
+## Análise Exploratória das Variáveis Numéricas
+Veja a seguir o sumário das variáveis numéricas. Interessante observar a quantidade de valores faltantes nas variáveis `feature_0`, `feature_10`, `feature_12` e `feature_16`. A variável `feature_0` chega a ter ```r paste(round(sum(is.na(train_set_numeric$feature_0)) / nrow(train_set_numeric) * 100), "%", sep="")``` de valores faltantes. Irei lidar com esse problema mais a diante.
+
+
+```{r, label=missing_values, cache=TRUE}
+apply(train_set_numeric, 2, summary)
+```
+
+
+### Análise Univariada
+Observar que a maioria das variáveis númericas possuem distribuições que diferem da normal.
+
+```{r, label=histogram_default, cache=TRUE}
+par(mfrow=c(3,4))
+for (i in 1:ncol(train_set_numeric)) {
+  hist(train_set_numeric[, i], main=names(train_set_numeric)[i], xlab="")
+}
+```
+
+
+A uma primeira impressão, as variáveis parecem ser da seguinte forma:
+
+ - exponencial: `feature_0`, `feature_7`, `feature_9`, `feature_12`, `feature_14` e `feature_15` 
+ - bimodal: `feature_8` e `feature_11`
+ - normal com assimetria positiva: `target` e talvez `feature_16`
+ - laplaciana: `feature_10`
+
+Ajustando os intervalos de cada histograma, algumas características interessantes são ressaltadas. Nos histogramas que mostro a seguir, cada valor único foi representado em um único intervalo.
+
+```{r, label=histogram_one_per_bin, cache=TRUE}
+par(mfrow=c(3,4))
+for (i in 1:ncol(train_set_numeric)) {
+  hist(train_set_numeric[, i], main=names(train_set_numeric)[i], breaks=length(unique(train_set_numeric[, i])), xlab="")
+}
+```
+
+Os histogramas acima reforçam a maioria das minhas suspeitas:
+
+ - exponencial: `feature_0`, `feature_7`, `feature_9`, `feature_12`, `feature_14` e `feature_15` 
+ - bimodal: `feature_8` e `feature_11`
+ - normal com assimetria positiva: `target`
+ - laplaciana: `feature_10` e `feature_16`
+
+A `feature_16` que parecia uma normal com assimetria positiva se mostrou mais uma laplaciana com a nova configuração de intervalos. Plotando a densidade dessas distribuições, pode ser que algo relevante se mostre.
+
+```{r, label=density, echo=FALSE, cache=TRUE}
+par(mfrow=c(3,5))
+for (i in 1:ncol(train_set_numeric)) {
+  plot(density(train_set_numeric[, i], na.rm=TRUE), main=names(train_set_numeric)[i], xlab="")
+}
+```
+
+Os gráficos acima com as densidades das variáveis são claros. É realmente provável que as distribuições seja as que indiquei acima.
+
+
+
+
+### Análise Multivariada
+
+É interessante ter uma ideia de como as variáveis se relacionam entre si. A função `pairs` permite visualizar o comportamento de cada par de variável.
+
+```{r, label=pairs, echo=TRUE, cache=TRUE}
+pairs(train_set_numeric)
+```
+
+Interessante notar o padrão linear entre as variáveis `feature_8` e `feature_11`. Até parecem iguais. Analisando mais atentamente seus histogramas e gráficos de função de densidade, percebe-se que realmente parecem serem amostras de uma mesma distribuição. Entretanto, ambas diferem na escala e a variável `feature_11` possui apenas valores discretos.
+
+```{r, cache=TRUE}
+sort(unique(train_set_numeric$feature_11))
+```
+
+Observe também os pares formados pelas variáveis `feature_0`, `feature_7`, `feature_9`, `feature_10`, `feature_12`, `feature_14`, `feature_15` e `feature_16`. Grande parte delas possuem relação linear.
+
+Observe também como a variável `target` se relaciona com as variáveis `feature_7`, `feature_9`, `feature_12`, `feature_14`, `feature_15`. Parece que elas sozinhas explicam boa parte da variância da variável `target`.
+
+```{r, label=correlation, echo=FALSE, cache=TRUE}
+correlation <- cor(train_set_numeric, use="complete")
+corrplot(abs(correlation), order="original", cl.lim=c(0,1), type="lower", diag=FALSE)
+```
+
+
+
+
+
+### Pré-processamento das Variáveis Numéricas
+
+A seguir, mostro os histogramas e funções de densidade das variáveis transformadas. A transformação que utilizei é a `YeoJohnson`, uma variante da `Box-Cox` que aceita valores nulos e negativos. Não apliquei apliquei às variáveis que aparentam ser bimodais (`feature_8` e `feature_11`). Para cada variável, a primeira linha correspnde aos valores originais e a segunda aos valores transformados.
+
+
+```{r, label=compute_density_power, echo=FALSE, cache=TRUE}
+feats_id_power <- c("feature_0", "feature_7", "feature_9", "feature_10", "feature_12", "feature_14", "feature_15", "feature_16")
+preprocessParams <- preProcess(train_set_numeric[, feats_id_power], method=c("YeoJohnson"))
+train_set_power <- train_set_numeric
+train_set_power[, feats_id_power] <- predict(preprocessParams, train_set_numeric[, feats_id_power])
+```
+
+
+```{r, label=density_power, echo=FALSE, cache=TRUE}
+for (i in 1:8) {
+  col <- feats_id_power[i]
+  print(col)
+
+  data <- train_set_numeric[, col]
+  breaks <- length(unique(data))
+  par(mfrow=c(2,3))
+  hist(data, main="default breaks", xlab="", ylab="")
+  hist(data, main="binwidth = 1", breaks=breaks, xlab="", ylab="")
+  plot(density(data, na.rm=TRUE), main="density", xlab="", ylab="")
+
+  data <- train_set_power[, col]
+  breaks <- length(unique(data))
+  hist(data, main="default breaks", xlab="", ylab="")
+  hist(data, main="binwidth = 1", breaks=breaks, xlab="", ylab="")
+  plot(density(data, na.rm=TRUE), main="density", xlab="", ylab="")
+}
+```
+
+
+Apresento a seguir o gráfico da correlação entre as variáveis transformadas. A julgar por esse gráfico, a transformação que apliquei aumentou a correlação entre as variáveis e entre as variáveis e a variável `target`.
+
+
+#### Correlação Dados Originais
+
+```{r, label=correlation_columns, echo=FALSE, cache=TRUE}
+cols <- c(feats_id_power, "target")
+```
+
+```{r, label=correlation_power324, echo=FALSE, cache=TRUE}
+correlation <- cor(train_set_numeric[, cols], use="complete")
+corrplot(abs(correlation), order="original", cl.lim=c(0,1), type="lower", diag=FALSE)
+```
+
+#### Correlação Dados Transformados
+
+```{r, label=correlation_power, echo=FALSE, cache=TRUE}
+correlation <- cor(train_set_power[, cols], use="complete")
+corrplot(abs(correlation), order="original", cl.lim=c(0,1), type="lower", diag=FALSE)
+```
+
+
+
+
+
+## Análise Exploratória das Variáveis Categóricas
+
+Voltando agora para as variáveis categóricas, observe que algumas delas possuem um número altíssimo de níveis e uma delas possui apenas um nível.
+
+```{r, label=number_of_levels, cache=TRUE}
+for (i in 1:length(train_set_factor)) {
+  col <- train_set_factor[, i]
+  print(paste(names(train_set_factor)[i], length(unique(col))))
+}
+```
+
+Variáveis categóricas com alto número de níveis afetam negativamente métodos baseados em árvore de decisão, pois o método terá que testar $2^n$ possíveis cortes para $n$ níveis em cada galho da árvore onde a variável for testada.
+
+
+### Pré-processamento das Variáveis Categóricas
+
+Para uma primeira análise, irei remover essas variáveis destoantes. 
+
+```{r, label=remove_categorical_madness, cache=TRUE}
+remove_id <- c("feature_1", "feature_2", "feature_3", "feature_13", "feature_17")
+train_set[, remove_id] <- NULL
+valid_set[, remove_id] <- NULL
+numeric_variables <- which(mapply(is.numeric, train_set) == TRUE)
+factor_variables  <- which(mapply(is.factor, train_set)  == TRUE)
+train_set_numeric <- train_set[, numeric_variables]
+train_set_factor  <- train_set[, factor_variables]
+```
+
+Subsequentemente, poderei voltar à essas variáveis que exclui e processá-las de forma apropriada possivelmente: 
+
+- trocando as pelas suas frequências
+- trocando as pela média e variância da variável `target`
+- combinação das duas acima
+
+
+
+
+
+
+## Valores Faltantes
+
+A base de dados fornecida contém diversos valores faltantes, como mostrado no mapa a seguir.
+
+```{r, label=missmap, echo=FALSE, cache=TRUE}
+missmap(train_all, col=c("gray", "black"))
+```
+
+A quantidade de casos com um ou mais valores faltantes é extremamente alto, chegando a mais de 99% dos dados.
+
+```{r, label=dataset_na_omit, echo=FALSE, cache=TRUE}
+sprintf("Todos: %d", nrow(train_all))
+sprintf("Casos completos (sem nenhum valor faltante): %d", nrow(na.omit(train_all)))
+sprintf("Proporção desses casos na base: %.2f%%", nrow(na.omit(train_all)) / nrow(train_all) * 100)
+```
+
+O pacote CARET do R fornece três métodos para imputar valores faltantes: `medianImpute`, `knnImpute` e `bagImpute`. Avaliarei esses métodos durante a construção do modelo, onde essas técnicas serão utilizadas para completar valores faltantes a cada passo da validação cruzada.
+
+
+
+
+
+
+# Ajuste de Modelos
+
+Utilizei o pacote CARET do R para avaliar o desempenho das técnicas de pré-processamento e de modelagem que selecionei. Para uma primeira rodada do ciclo de construção do modelo, utilizei os pré-processamentos:
+
+- medianImpute
+- YeoJohnson
+
+Utilizei os seguintes métodos para a modelagem dos dados:
+
+- ranger - Random Forest
+- glm - Generalized Linear Model
+- xgbTree - Extreme Gradient Tree Boosting
+
+Utilizei validação cruzada com 5 dobras e 3 repetições. Como a base é relativamente pequena, com mais tempo eu optaria por utilizar mais dobras. Utilizei as opções *default* dos métodos configuradas no pacote CARET.
+
+A métrica utilizada no desafio é a mediana do absoluto da diferença entre o erro e valor predito.
+$$
+Erro = \text{mediana}(\text{abs}(y_{true} - y_{pred}) / y_{true} )
+$$
+
+Portanto, alterei a métrica do CARET para
+
+```{r, label="metric_MED", eval=FALSE}
+medianSummary <- function (data, lev=NULL, model=NULL) {
+  out <- median(abs(data$obs - data$pred) / data$obs)
+  names(out) <- "MED"
+  out
+}
+````
+
+Veja na seguinte figura os resultados obtidos com essa métrica. Os nomes dos modelos são formados pela concatenção do nome do método utilizado seguido pelo(s) pré-processamento(s) utilizado(s).
+
+```{r}, label="model_results", echo=FALSE, cache=TRUE}
+load("fit_results.RData")
+# dotplot(results)
+bwplot(results)
+```
+
+Observe que o pré-processamento `YeoJohnson` diminui bastante o erro mediano do modelo gerado com `glm`. Isso já não acontece nos modelos gerados com `xgbTree` e `ranger`, possivelmente por esses métodos serem menos sensíveis ao tipo de distribuição das variáveis preditoras.
+
+Observe também como os modelos gerados com `ranger` e `xgbTree` superaram os demais. Esse baixo erro mediano absoluto tem como preço um alto custo computacional. Veja a seguir um gráfico de dispersão do erro mediano absoluto versus o tempo gasto para se gerar o modelo.
+
+```{r}, label="model_results_timing", echo=FALSE, cache=TRUE}
+model_names_aux  <- names(results$methods)
+model_names_aux <- strsplit(model_names_aux, "_")
+method_names <- sapply(model_names_aux, "[", 1)
+preproc_names <- sapply(model_names_aux, "[", 3)
+preproc_names[is.na(preproc_names)] <- "NONE"
+error <- mapply(mean, results$values[, -1], MoreArgs=list(na.rm=TRUE))
+timings <- round(results$timings/60)$Everything
+cost <- data.frame(preproc_names, method_names, error, timings)
+ggplot(data=cost) +
+  geom_point(aes(x=timings, y=error, col=method_names, shape=preproc_names)) +
+  xlab("Custo (minutos)") + 
+  ylab("Erro mediano absoluto") +
+  guides(color=guide_legend("Métodos"), shape=guide_legend("Transformação"))
+```
+
+Observe que os dois modelos que levaram mais de 45 minutos para serem aprendidos foram os realizados com o método `ranger`. Se fosse para escolher apenas um método para continuar a ajustar o modelo, eu escolheria o `xgbTree`. Mesmo que o `ranger` tenha gerado modelos com erros mais baixos, o método `xgbTree` possui uma gama maior de parâmetros para serem explorados e o seu tempo de execução é consideravelmente menor que o do `ranger`, chegando a 25 vezes mais rápido nos testes que fiz (não levando em conta o tempo de execução do pré-processamento).
+
+Os próximos passos seriam explorar mais os parâmetros de cada método de forma a aprimorar o ajuste dos modelos aos dados. Como esse desfaio contempa apenas uma visão geral dos passos de ajuste de modelo, finalizo aqui a fase de exploração da construção do modelo. 
+
+
+
+
+
+
+# Construção do Modelo Final e sua Validação
+Para finalizar, escolho os parâmetros que gerou o modelo com o menor erro mediano absoluto. Dentre os modelos que gerei, irei utilizar os parâmetros do modelo gerado pelo método `ranger` com pré-processamento `medianImpute`.
+
+```{r}, label="model_final_train", eval=FALSE}
+train_set <- train_all[-valid_ind, ]
+dummies <- dummyVars(~ ., data=train_set, levelsOnly=FALSE)
+train_set <-  as.data.frame(predict(dummies, newdata=train_set))
+preprocessParams <- preProcess(train_set, method="medianImpute")
+train_set <- predict(preprocessParams, train_set)
+
+valid_set <- train_all[valid_ind, ]
+valid_set <-  as.data.frame(predict(dummies, newdata=valid_set))
+valid_set <-  predict(preprocessParams, newdata=valid_set)
+
+fit <- ranger(target ~ ., data=train_set, mtry=mtry, write.forest=TRUE, importance='impurity')
+```
+
+Observe no gráfico a seguir a contribuição (média) da importância de cada variável na predição dos valores da variável `target`. Essa informação é interessante para a fase de engenharia de características (do inglês, *feature engineering*) de métodos que não possuem mecanismo interno de seleção de variáveis. Claro que o impacto no modelo dessa seleção de características deve ser estimada com validação cruzada. Nessa figura, condensei as variáveis que possuem valores abaixo de 0.5% em apenas uma com o rótulo `Demais`.
+
+```{r}, label="model_final_variable_importance", echo=FALSE, cache=TRUE}
+# Load variable importance (imp)
+load("fit_final_importance.RData")
+par(las=2) # make label text perpendicular to axis
+par(mar=c(5, 15, 4, 2)) # increase y-axis margin.
+barplot(imp * 100, main="Importância das Variáveis (%)", horiz=TRUE, cex.names=0.8)
+```
+
+
+Por fim, o erro mediano absoluto estimado com os casos que reservei do conjunto de treinamento (20%) é
+
+```{r}, label="model_final_prediction", echo=FALSE, cache=TRUE}
+load("fit_final_predictions.RData")
+med <- median(abs(valid_set$target - predictions$predictions) / valid_set$target)
+sprintf("Erro mediano absoluto: %.4f", med)
+```
+
+que é condizente com o erro estimado durante a validação cruzada. Portanto, esse modelo aparenta não estar sobreajustado aos casos de treinamento e é um bom candidato para ser colocado em produção.
+
+Os valores preditos para a variável target to arquivo `test.csv` estão gravados no arquivo `test_predictions.csv`.
+
+
+
+
+</br>
+</br>
+</br>
+</br>
+
